@@ -7,6 +7,15 @@ import type { Config } from "./config.js";
 import { FlowBrowserAdapter } from "./flow-adapter.js";
 import { sha256File, validateMedia } from "./media-validator.js";
 import { StateStore } from "./state.js";
+import type { JobRecord } from "./types.js";
+
+function assertNoUnresolvedShot(jobs: JobRecord[], idempotencyKey: string, exceptJobId?: string) {
+  const shotKey = idempotencyKey.slice(0, idempotencyKey.lastIndexOf(":"));
+  const unresolved = jobs.find((job) => job.id !== exceptJobId
+    && job.idempotencyKey.slice(0, job.idempotencyKey.lastIndexOf(":")) === shotKey
+    && ["submitted", "generating", "paused"].includes(job.state));
+  if (unresolved) throw new Error(`This shot has an unresolved job ${unresolved.id}. Continue observing that job or verify its actual completion/failure in Flow before creating another version. A polling timeout does not prove failure; no new generation was submitted.`);
+}
 
 function response(value: unknown) {
   return {
@@ -16,20 +25,24 @@ function response(value: unknown) {
 }
 
 export function createGoogleFlowServer(config: Config) {
+  const startedAt = new Date().toISOString();
   const store = new StateStore(config.databaseFile ?? config.stateFile, config.stateFile);
   const flow = new FlowBrowserAdapter(config, store);
   const server = new McpServer(
-    { name: "google-flow-studio-mcp", version: "1.0.0" },
+    { name: "google-flow-studio-mcp", version: "1.0.1" },
     {
       instructions: [
-        "Use project_create before operating Google Flow.",
-        "At the start of every project call flow_start_login, then wait for the user to sign in personally and close the login Chrome window.",
+        "Reuse existing local projects from project_list/project_get; use project_create only for a new local project.",
+        "Check flow_auth_status and reuse a ready browser session across projects and resumptions. Do not restart login merely because a project or conversation changed.",
+        "If login is required, call flow_start_login once and wait for the user to sign in personally and close the login Chrome window. When the user says login is complete, call flow_confirm_login directly; polling auth status cannot record the user's confirmation. Do not call flow_start_login again while awaiting that confirmation.",
         "Never ask for, read, type, store, or repeat passwords, verification codes, recovery answers, or 2FA tokens.",
         "Call flow_inspect_page before filling or clicking controls.",
         "Generation submission requires explicit user approval because it may spend credits.",
         "Before preparing video, establish the user's final delivery resolution: 720p or 1080p. Ask only if neither the request nor the saved project specifies it.",
         "Default to 360p generation for a 720p deliverable and 720p generation for a 1080p deliverable, then download the matching free upscaled option offered by Flow. Keep generation and delivery resolution distinct.",
         "Use flow_prepare_generation and flow_submit_generation for video so the saved resolution is set and checked before spending credits. Download through flow_download_media to retain the target resolution.",
+        "Polling timeout and lastObservedAt describe local observation, not Google server progress. Retry flow_wait_for_generation with the same jobId; never infer failure or submit another version just because no matching media was found.",
+        "Use this connected MCP instance for browser operations. Starting another stdio client against the same browser profile can conflict with its owner. After updating code, reconnect the MCP server before using the new build.",
       ].join(" "),
     },
   );
@@ -48,7 +61,8 @@ export function createGoogleFlowServer(config: Config) {
       const ffprobeCheck = spawnSync(ffprobe, ["-version"], { windowsHide: true, timeout: 5_000 });
       return response({
         status: store.health().integrity === "ok" && existsSync(config.browserExecutable) && ffprobeCheck.status === 0 ? "healthy" : "degraded",
-        version: "1.0.0",
+        version: "1.0.1",
+        runtime: { processId: process.pid, startedAt, entrypoint: process.argv[1] },
         database: store.health(),
         browserExecutable: { path: config.browserExecutable, exists: existsSync(config.browserExecutable) },
         ffprobe: { command: ffprobe, available: ffprobeCheck.status === 0 },
@@ -91,7 +105,7 @@ export function createGoogleFlowServer(config: Config) {
     "project_create",
     {
       title: "Create Google Flow project state",
-      description: "Create durable local project state. Save the user's final video resolution when known; ask before video preparation if it is still unspecified. This also requires a fresh user-completed login checkpoint.",
+      description: "Create durable local project state without resetting the browser login. Reuse an existing project when continuing work. Save the user's final video resolution when known; ask before video preparation if it is still unspecified.",
       inputSchema: z.object({
         title: z.string().min(1),
         brief: z.string().default(""),
@@ -140,18 +154,21 @@ export function createGoogleFlowServer(config: Config) {
     "flow_start_login",
     {
       title: "Open Google Flow login",
-      description: "Open visible Chrome at the official Google Flow page and pause for a fresh user-completed sign-in.",
-      inputSchema: z.object({ projectId: z.string().uuid() }),
+      description: "Reuse a confirmed session or an existing pending login. Open ordinary visible Chrome only when user login is needed. Once the user reports completion, call flow_confirm_login instead of restarting login.",
+      inputSchema: z.object({
+        projectId: z.string().uuid(),
+        reopen: z.boolean().default(false).describe("Use only when the user explicitly asks to reopen a closed unfinished login window or change accounts. Normal retries reuse the existing session."),
+      }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ projectId }) => response(await flow.startLogin(projectId)),
+    async ({ projectId, reopen }) => response(await flow.startLogin(projectId, reopen)),
   );
 
   server.registerTool(
     "flow_auth_status",
     {
       title: "Check Google Flow login status",
-      description: "Check browser navigation state without reading credential fields.",
+      description: "Check browser navigation state without reading credential fields. A pending user confirmation is not proof of expired login. When the user reports login completed and the window closed, call flow_confirm_login directly.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
@@ -162,7 +179,7 @@ export function createGoogleFlowServer(config: Config) {
     "flow_confirm_login",
     {
       title: "Confirm Google Flow login checkpoint",
-      description: "Record the user's confirmation that fresh login, membership/access, and usable credits were checked.",
+      description: "After the user reports login completed and the login window closed, record their confirmation of account access and credits. A prior completed confirmation remains valid across projects; do not ask again merely to resume work.",
       inputSchema: z.object({
         projectId: z.string().uuid(),
         userConfirmedFreshSignIn: z.literal(true),
@@ -228,8 +245,11 @@ export function createGoogleFlowServer(config: Config) {
   const projectGuard = async (projectId: string) => {
     const state = await store.read();
     if (!state.projects.some((project) => project.id === projectId)) throw new Error(`Project not found: ${projectId}`);
-    if (state.auth.status !== "ready" || state.auth.freshLoginForProjectId !== projectId) {
-      throw new Error("This project does not have a completed fresh-login checkpoint. Call flow_start_login and flow_confirm_login.");
+    if (state.auth.status !== "ready") {
+      if (state.auth.status === "awaiting_user_fresh_sign_in" || state.auth.status === "signed_in_unconfirmed") {
+        throw new Error("Login is awaiting user confirmation. If the user has already reported login complete and closed the login window, call flow_confirm_login now. Otherwise wait for the user; do not restart login or keep polling for confirmation.");
+      }
+      throw new Error("The browser session is not ready. Check flow_auth_status and call flow_start_login only if user login is required.");
     }
   };
 
@@ -422,6 +442,7 @@ export function createGoogleFlowServer(config: Config) {
         )) throw new Error("This shot/version already has a different video resolution plan. Use a new version for a new plan; the existing job was not changed.");
         return response({ job: existing, reused: true });
       }
+      assertNoUnresolvedShot(current.jobs, idempotencyKey);
       const project = current.projects.find((item) => item.id === input.projectId)!;
       const finalVideoResolution = input.operation === "video" ? input.finalVideoResolution ?? project.finalVideoResolution : undefined;
       if (input.operation === "video" && !finalVideoResolution) {
@@ -491,6 +512,7 @@ export function createGoogleFlowServer(config: Config) {
       }
       if (job.state !== "prepared") throw new Error(`Job must be prepared before submission; current state is ${job.state}.`);
       await projectGuard(job.projectId);
+      assertNoUnresolvedShot(state.jobs, job.idempotencyKey, job.id);
       if (job.operation === "video") {
         if (!job.finalVideoResolution || !job.generationResolution) {
           throw new Error("This prepared video has no saved resolution plan. Ask for the delivery target and prepare a new version before spending credits.");
@@ -519,7 +541,7 @@ export function createGoogleFlowServer(config: Config) {
     "flow_wait_for_generation",
     {
       title: "Wait for a real Google Flow generation result",
-      description: "Poll the linked Flow project until a new media tile is observed, three consecutive failure observations occur, or timeout is reached. Persists the result automatically.",
+      description: "Observe the linked Flow project for a new media tile, repeated failure notices, or timeout. Timeout means the provider result is unknown, not failed or confirmed generating. Retry this tool with the same jobId; do not submit a replacement based only on timeout or lastObservedAt.",
       inputSchema: z.object({
         jobId: z.string().uuid(),
         timeoutSeconds: z.number().int().min(10).max(1800).default(600),
@@ -564,7 +586,12 @@ export function createGoogleFlowServer(config: Config) {
         return response({ status: "failed", job: updated, observations: observed.observations });
       }
       const updated = await store.updateJob(job.id, { state: "generating", lastObservedAt: new Date().toISOString() });
-      return response({ status: "timeout", job: updated, observations: observed.observations, retrySafe: true });
+      return response({
+        status: "timeout", providerStatus: "unknown", job: updated, observations: observed.observations,
+        observation: { pageUrl: observed.page.url, pageTitle: observed.page.title, visibleMediaCount: observed.page.media.length, failureCount: observed.page.failureCount },
+        retrySafe: true, retryAction: "flow_wait_for_generation", resubmitSafe: false,
+        message: "No matching result was observed before timeout. The saved generating state and lastObservedAt track local polling, not confirmed Google queue progress. Continue observing this job or inspect the project; do not submit a replacement based on this timeout.",
+      });
     },
   );
 

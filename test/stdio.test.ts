@@ -20,6 +20,7 @@ test("stdio client discovers the expected MCP tools", async () => {
 
   try {
     await client.connect(transport);
+    assert.equal(client.getServerVersion()?.version, "1.0.1");
     const { tools } = await client.listTools();
     const names = new Set(tools.map((tool) => tool.name));
     for (const expected of [
@@ -46,6 +47,8 @@ test("stdio client discovers the expected MCP tools", async () => {
     assert.ok(byName.get("project_create")?.inputSchema.properties?.finalVideoResolution);
     assert.ok(byName.get("flow_prepare_generation")?.inputSchema.properties?.generationResolution);
     assert.ok(byName.get("flow_download_media")?.inputSchema.properties?.resolution);
+    assert.ok(byName.get("flow_start_login")?.inputSchema.properties?.reopen);
+    assert.match(byName.get("flow_auth_status")?.description ?? "", /flow_confirm_login/);
   } finally {
     await client.close();
     await rm(directory, { recursive: true, force: true });

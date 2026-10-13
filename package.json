@@ -1,6 +1,6 @@
 {
   "name": "google-flow-studio-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "Local MCP tools for Google Flow projects, reference media, video workflows, and downloads.",
   "license": "MIT",
@@ -35,7 +35,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json && node dist/src/index.js",
     "start": "node dist/src/index.js",
-    "test": "npm run build && node --test dist/test/state.test.js dist/test/server.test.js dist/test/stdio.test.js dist/test/flow-adapter.test.js",
+    "test": "npm run build && node --test dist/test/state.test.js dist/test/server.test.js dist/test/stdio.test.js dist/test/flow-adapter.test.js dist/test/auth.test.js",
     "check": "tsc -p tsconfig.json --noEmit",
     "prepublishOnly": "npm run check && npm test",
     "prepack": "npm run build",

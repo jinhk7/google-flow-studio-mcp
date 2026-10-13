@@ -9,6 +9,7 @@ import { StateStore } from "./state.js";
 import type { AuthRecord, FlowMediaItem, PageInspection } from "./types.js";
 
 const FLOW_URL = "https://flow.google.com";
+const LOGIN_PENDING_MESSAGE = "请在专用浏览器中亲自完成 Google 登录，进入 Flow 后关闭该窗口。用户确认完成后，调用 flow_confirm_login；不要重复调用 flow_start_login 或仅轮询 flow_auth_status。";
 const CREDIT_ACTION = /^(generate|create|生成|制作|产生)(\s|$)/i;
 const BLOCKED_AUTH_ACTION = /(password|passkey|verification|验证码|验证|sign\s*out|log\s*out|退出登录|登出)/i;
 
@@ -33,9 +34,16 @@ export class FlowBrowserAdapter {
 
   constructor(private readonly config: Config, private readonly store: StateStore) {}
 
-  async startLogin(projectId: string): Promise<AuthRecord> {
+  async startLogin(projectId: string, reopen = false): Promise<AuthRecord> {
     const state = await this.store.read();
     if (!state.projects.some((project) => project.id === projectId)) throw new Error(`Project not found: ${projectId}`);
+    if (!reopen && state.auth.status === "ready") {
+      const auth = await this.getAuthStatus();
+      if (auth.status === "ready") return auth;
+    }
+    if (!reopen && state.auth.status === "awaiting_user_fresh_sign_in" && state.auth.initiatedAt) {
+      return { ...state.auth, lastMessage: LOGIN_PENDING_MESSAGE };
+    }
     await this.close();
     const loginBrowser = spawn(this.config.browserExecutable, [
       `--user-data-dir=${this.config.profileDir}`,
@@ -49,14 +57,17 @@ export class FlowBrowserAdapter {
         status: "awaiting_user_fresh_sign_in",
         initiatedAt: new Date().toISOString(),
         lastUrl: FLOW_URL,
-        lastMessage: "请在普通 Chrome 中亲自完成全新登录。进入 Flow 后关闭此专用 Chrome 的所有窗口，再让 AI 确认登录。不要把密码或验证码发送给 AI。",
+        lastMessage: LOGIN_PENDING_MESSAGE,
       };
     });
     return next.auth;
   }
 
   async getAuthStatus(): Promise<AuthRecord> {
-    if (!this.context || !this.page || this.page.isClosed()) return (await this.store.read()).auth;
+    const saved = (await this.store.read()).auth;
+    if (saved.status !== "ready" && (!this.context || !this.page || this.page.isClosed())) {
+      return saved.status === "awaiting_user_fresh_sign_in" ? { ...saved, lastMessage: LOGIN_PENDING_MESSAGE } : saved;
+    }
     const detected = await this.detectAuthentication();
     const state = await this.store.read();
     const status = detected === "login_required" ? "login_required" : state.auth.status === "ready" ? "ready" : "signed_in_unconfirmed";
@@ -64,8 +75,8 @@ export class FlowBrowserAdapter {
       draft.auth.status = status;
       draft.auth.lastUrl = this.page!.url();
       draft.auth.lastMessage = status === "login_required"
-        ? "请在可见浏览器中完成 Google 登录。"
-        : status === "ready" ? "登录检查点已完成。" : "浏览器已登录；仍需用户确认全新登录、会员资格和可用额度。";
+        ? "当前页面需要 Google 登录。调用 flow_start_login 打开专用浏览器，由用户亲自登录；用户确认完成后调用 flow_confirm_login。"
+        : status === "ready" ? "Google Flow 登录已确认，可以继续读取或操作项目。" : "浏览器已登录；用户确认登录完成后调用 flow_confirm_login。";
     });
     return next.auth;
   }
@@ -82,22 +93,16 @@ export class FlowBrowserAdapter {
     }
     const state = await this.store.read();
     if (!state.projects.some((project) => project.id === input.projectId)) throw new Error(`Project not found: ${input.projectId}`);
-    try {
-      const page = await this.ensurePage();
-      if (!page.url().startsWith(FLOW_URL)) await page.goto(FLOW_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
-      if ((await this.detectAuthentication()) === "login_required") throw new Error("Google still shows a login page. Complete login in the normal Chrome window first.");
-    } catch (error) {
-      if (/profile.*in use|processsingleton|user data directory.*in use|singletonlock/i.test((error as Error).message)) {
-        throw new Error("The login Chrome is still running. Close all windows using the dedicated Flow profile, then confirm login again.", { cause: error });
-      }
-      throw error;
-    }
+    const page = await this.ensurePage();
+    if (!page.url().startsWith(FLOW_URL)) await page.goto(FLOW_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    if ((await this.getAuthStatus()).status === "login_required") throw new Error("Google still shows a login page. Complete login in the normal Chrome window first, then call flow_confirm_login.");
+    if (state.auth.status === "ready") return state.auth;
     const next = await this.store.update((draft) => {
       draft.auth.status = "ready";
       draft.auth.confirmedAt = new Date().toISOString();
       draft.auth.freshLoginForProjectId = input.projectId;
       draft.auth.lastUrl = this.page?.url();
-      draft.auth.lastMessage = "Fresh login, membership/access, and usable credits were user-confirmed.";
+      draft.auth.lastMessage = "Google Flow 登录已确认，可以继续读取或操作项目。";
     });
     return next.auth;
   }
@@ -137,7 +142,7 @@ export class FlowBrowserAdapter {
   async openMedia(input: { projectUrl: string; mediaId?: string; title?: string }): Promise<{ media: FlowMediaItem; page: PageInspection }> {
     await this.openFlowProject(input.projectUrl);
     const recorded = input.mediaId ? (await this.store.read()).assets.find((asset) =>
-      asset.providerMediaId === input.mediaId && asset.providerMediaUrl?.startsWith(`${input.projectUrl}/edit/`)) : undefined;
+      asset.providerMediaId === input.mediaId && this.isFlowProjectMediaUrl(asset.providerMediaUrl, input.projectUrl)) : undefined;
     const media: FlowMediaItem = recorded ? {
       tileId: input.mediaId!, title: recorded.title ?? input.mediaId!, href: recorded.providerMediaUrl,
       kind: recorded.kind === "image" || recorded.kind === "video" ? recorded.kind : "unknown",
@@ -148,7 +153,9 @@ export class FlowBrowserAdapter {
     } else {
       const tile = media.providerMediaId
         ? page.locator(`flow-grid-tile-container [data-media-id="${media.providerMediaId}"]`)
-        : page.locator("flow-grid-tile-container").and(page.getByLabel(media.title, { exact: true }));
+        : media.thumbnailUrl
+          ? await this.findTileByThumbnail(page, media.thumbnailUrl)
+          : page.locator("flow-grid-tile-container").and(page.getByLabel(media.title, { exact: true }));
       await Promise.all([
         page.waitForURL((url) => /\/project\/[^/]+\/edit\/[^/]+/.test(url.pathname), { timeout: 30_000 }),
         tile.click(),
@@ -183,7 +190,7 @@ export class FlowBrowserAdapter {
         item.kind === input.expectedKind && !baseline.has(item.tileId) && (!item.providerMediaId || !baseline.has(item.providerMediaId)));
       if (created) {
         if (!created.href && !created.providerMediaId) {
-          const opened = await this.openMedia({ projectUrl: input.projectUrl, title: created.title });
+          const opened = await this.openMedia({ projectUrl: input.projectUrl, mediaId: created.tileId, title: created.title });
           return { status: "complete", media: opened.media, observations, page: opened.page };
         }
         return { status: "complete", media: created, observations, page: inspection };
@@ -407,6 +414,11 @@ export class FlowBrowserAdapter {
         acceptDownloads: true,
         ignoreDefaultArgs: ["--no-sandbox"],
         args: ["--no-first-run", "--disable-default-apps"],
+      }).catch((error: Error) => {
+        if (/profile.*in use|processsingleton|user data directory.*in use|singletonlock|opening in existing browser session|正在现有.*浏览器会话/i.test(error.message)) {
+          throw new Error("The dedicated Flow profile is open in another browser window or MCP instance. Close that window or stop the other MCP instance, then retry the same tool. The saved login is preserved; do not restart login.", { cause: error });
+        }
+        throw error;
       });
       this.context = context;
       context.once("close", () => {
@@ -438,7 +450,8 @@ export class FlowBrowserAdapter {
           const video = element.querySelector("video") as HTMLVideoElement | null;
           const image = element.querySelector("img") as HTMLImageElement | null;
           const isVideo = Boolean(video || element.querySelector("flow-video-tile"));
-          const source = isVideo ? video?.getAttribute("src") ?? "" : image?.getAttribute("src") ?? "";
+          const thumbnailUrl = image?.getAttribute("src") ?? undefined;
+          const source = isVideo ? video?.getAttribute("src") ?? thumbnailUrl ?? "" : thumbnailUrl ?? "";
           let providerMediaId = (isVideo ? video?.getAttribute("data-media-id") : image?.getAttribute("data-media-id")) ?? undefined;
           if (!providerMediaId) {
             try { providerMediaId = new URL(source, location.origin).searchParams.get("name") ?? undefined; } catch { providerMediaId = undefined; }
@@ -449,13 +462,14 @@ export class FlowBrowserAdapter {
           });
           const title = element.getAttribute("aria-label") ?? leaf?.textContent?.replace(/\s+/g, " ").trim() ?? image?.getAttribute("alt") ?? domTileId;
           const tileId = href ? new URL(href).pathname.split("/").filter(Boolean).at(-1) ?? domTileId.replace(/^fe_id_/, "")
-            : domTileId.replace(/^fe_id_/, "") || providerMediaId || (isVideo && title ? `title:${title}` : "");
+            : domTileId.replace(/^fe_id_/, "") || providerMediaId || (isVideo && thumbnailUrl ? `thumbnail:${thumbnailUrl}` : isVideo && title ? `title:${title}` : "");
           return {
             tileId,
             providerMediaId,
             title: title || tileId,
             kind: isVideo ? "video" as const : image ? "image" as const : "unknown" as const,
             href,
+            thumbnailUrl,
           };
         });
         if (item.tileId && item.kind !== "unknown") results.push(item);
@@ -465,14 +479,42 @@ export class FlowBrowserAdapter {
     return [...new Map(identifiable.map((item) => [item.tileId, item])).values()];
   }
 
+  private async findTileByThumbnail(page: Page, thumbnailUrl: string): Promise<Locator> {
+    const tiles = page.locator("flow-grid-tile-container");
+    const index = await tiles.evaluateAll((elements, source) => elements.findIndex((element) =>
+      Array.from(element.querySelectorAll("img")).some((image) => image.getAttribute("src") === source)), thumbnailUrl);
+    if (index < 0) throw new Error("Flow media thumbnail is no longer visible in the project grid.");
+    return tiles.nth(index);
+  }
+
+  private isFlowProjectMediaUrl(mediaUrl: string | undefined, projectUrl: string): boolean {
+    if (!mediaUrl) return false;
+    try {
+      const media = new URL(mediaUrl);
+      const project = new URL(projectUrl);
+      const mediaProjectId = media.hostname === "flow.google.com"
+        ? media.pathname.match(/^\/project\/([^/]+)\/edit\/[^/]+\/?$/)?.[1]
+        : media.hostname === "labs.google"
+          ? media.pathname.match(/^\/fx\/tools\/flow\/project\/([^/]+)\/edit\/[^/]+\/?$/)?.[1] : undefined;
+      const projectProjectId = project.hostname === "flow.google.com"
+        ? project.pathname.match(/^\/project\/([^/]+)(?:\/|$)/)?.[1]
+        : project.hostname === "labs.google"
+          ? project.pathname.match(/^\/fx\/tools\/flow\/project\/([^/]+)(?:\/|$)/)?.[1] : undefined;
+      return media.protocol === "https:" && project.protocol === "https:"
+        && mediaProjectId !== undefined && mediaProjectId === projectProjectId;
+    } catch {
+      return false;
+    }
+  }
+
   private async findMedia(input: { mediaId?: string; title?: string }): Promise<FlowMediaItem> {
     const normalizedTitle = input.title?.trim().toLocaleLowerCase();
     let lastMatches: FlowMediaItem[] = [];
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const items = await this.inspectMedia();
-      lastMatches = items.filter((item) =>
-        (input.mediaId && (item.tileId === input.mediaId || item.providerMediaId === input.mediaId)) ||
-        (normalizedTitle && item.title.toLocaleLowerCase().includes(normalizedTitle)));
+      lastMatches = items.filter((item) => input.mediaId
+        ? item.tileId === input.mediaId || item.providerMediaId === input.mediaId
+        : normalizedTitle && item.title.toLocaleLowerCase().includes(normalizedTitle));
       if (lastMatches.length === 1) return lastMatches[0];
       if (lastMatches.length > 1) break;
       await (await this.ensurePage()).waitForTimeout(2_000);
@@ -506,8 +548,10 @@ export class FlowBrowserAdapter {
     const page = await this.ensurePage();
     const url = new URL(page.url());
     if (!["flow.google.com", "labs.google"].includes(url.hostname) || url.pathname === "/about") return "login_required";
-    const signInLinks = page.locator("a[href*='accounts.google.com']").filter({ hasText: /sign in|登录|登入/i });
-    return await signInLinks.count() ? "login_required" : "signed_in";
+    const signInControls = page.locator("a[href*='accounts.google.com'], button, [role='button']")
+      .filter({ hasText: /sign in|log in|登录|登入/i, hasNotText: /退出登录|退出登入|登出|sign\s*out|log\s*out/i })
+      .filter({ visible: true });
+    return await signInControls.count() ? "login_required" : "signed_in";
   }
 
   private async visibleControls(selector: string): Promise<VisibleControl[]> {

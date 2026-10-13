@@ -15,7 +15,7 @@ const handle = serveStdio(() => {
   return instance.server;
 });
 
-console.error("Google Flow Studio MCP 1.0.0 running on stdio");
+console.error("Google Flow Studio MCP 1.0.1 running on stdio");
 
 async function shutdown() {
   await activeFlow?.close();

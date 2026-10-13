@@ -19,7 +19,7 @@ const transport = new StdioClientTransport({
   env: process.env,
   stderr: 'pipe',
 });
-const client = new Client({ name: 'google-flow-studio-production-smoke', version: '1.0.0' });
+const client = new Client({ name: 'google-flow-studio-production-smoke', version: '1.0.1' });
 const call = async (name, args = {}) => {
   const request = { name, arguments: args };
   const deadline = name === 'flow_download_media' ? Date.now() + 300_000 : undefined;
@@ -52,8 +52,7 @@ try {
   }
   const mediaId = requestedMediaId ?? job.providerMediaId;
   const auth = await call('flow_auth_status');
-  assert.equal(auth.status, 'ready', 'Complete the user login checkpoint before running smoke');
-  assert.equal(auth.freshLoginForProjectId, projectId, 'Complete the login checkpoint for the selected project');
+  assert.equal(auth.status, 'ready', 'Confirm the browser profile login before running smoke');
 
   await call('flow_open_project', { projectId, projectUrl });
   const page = await call('flow_inspect_page');

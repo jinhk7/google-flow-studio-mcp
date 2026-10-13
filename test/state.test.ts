@@ -12,7 +12,7 @@ async function fixture() {
   return { directory, store };
 }
 
-test("creating a project establishes a fresh-login checkpoint in SQLite", async (t) => {
+test("creating a project preserves the initial browser state in SQLite", async (t) => {
   const { directory, store } = await fixture();
   t.after(() => { store.close(); return rm(directory, { recursive: true, force: true }); });
   const project = await store.createProject({
@@ -22,7 +22,7 @@ test("creating a project establishes a fresh-login checkpoint in SQLite", async 
   assert.equal(state.version, 2);
   assert.equal(state.projects[0].id, project.id);
   assert.equal(state.projects[0].title, "演示");
-  assert.equal(state.auth.status, "awaiting_user_fresh_sign_in");
+  assert.equal(state.auth.status, "browser_closed");
   assert.equal(store.health().integrity, "ok");
   assert.equal(store.health().journalMode, "wal");
 });
@@ -40,6 +40,20 @@ test("job creation is idempotent and failed retries get a new attempt", async (t
   const retry = await store.createJob({ projectId: project.id, operation: "video", idempotencyKey: key, prompt: "A slow push-in" });
   assert.equal(retry.reused, false);
   assert.equal(retry.job.attempt, 2);
+});
+
+test("creating another project preserves the confirmed browser session", async (t) => {
+  const { directory, store } = await fixture();
+  t.after(() => { store.close(); return rm(directory, { recursive: true, force: true }); });
+  const first = await store.createProject({ title: "First", brief: "", language: "en-US" });
+  const confirmedAt = new Date().toISOString();
+  await store.update((state) => {
+    state.auth = { status: "ready", confirmedAt, freshLoginForProjectId: first.id };
+  });
+  await store.createProject({ title: "Second", brief: "", language: "en-US" });
+  const { auth } = await store.read();
+  assert.equal(auth.status, "ready");
+  assert.equal(auth.confirmedAt, confirmedAt);
 });
 
 test("project delivery target and job generation settings survive closing and reopening SQLite", async (t) => {

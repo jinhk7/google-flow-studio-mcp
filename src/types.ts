@@ -111,6 +111,7 @@ export interface FlowMediaItem {
   title: string;
   kind: "image" | "video" | "unknown";
   href?: string;
+  thumbnailUrl?: string;
 }
 
 export interface PageInspection {

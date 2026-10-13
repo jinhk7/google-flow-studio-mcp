@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { chromium } from "playwright-core";
 
 import { loadConfig } from "../src/config.js";
 import { FlowBrowserAdapter } from "../src/flow-adapter.js";
+import { StateStore } from "../src/state.js";
 
 test("an empty ProseMirror prompt has a stable label distinct from the project title", async (t) => {
   const browser = await chromium.launch({ executablePath: loadConfig().browserExecutable, headless: true });
@@ -43,7 +47,7 @@ test("Flow discovers linked media, image IDs, and unique video titles", async (t
       <flow-image-tile><img data-media-id="second-image" src="${imageSource}" width="64" height="64"></flow-image-tile>
     </flow-grid-tile-container>
     <flow-grid-tile-container aria-label="Man sitting looking at street">
-      <flow-video-tile><img data-media-id="poster-image-only" src="${imageSource}" width="64" height="64"></flow-video-tile>
+      <flow-video-tile><img src="${imageSource}" width="64" height="64"></flow-video-tile>
     </flow-grid-tile-container>
     <flow-grid-tile-container aria-label="Duplicate video"><video width="64" height="64"></video></flow-grid-tile-container>
     <flow-grid-tile-container aria-label="Duplicate video"><video width="64" height="64"></video></flow-grid-tile-container>
@@ -61,9 +65,10 @@ test("Flow discovers linked media, image IDs, and unique video titles", async (t
   assert.equal(media[1].kind, "image");
   assert.equal(media[1].href, undefined);
   assert.equal(media[2].tileId, "second-image");
-  assert.equal(media[3].tileId, "title:Man sitting looking at street");
+  assert.equal(media[3].tileId, `thumbnail:${imageSource}`);
   assert.equal(media[3].kind, "video");
   assert.equal(media[3].providerMediaId, undefined);
+  assert.equal(media[3].thumbnailUrl, imageSource);
   assert.equal(media[3].href, undefined);
   assert.equal(await FlowBrowserAdapter.prototype["controlLabel"](page.locator("flow-grid-tile-container").first()), "Man holding coat lapel");
 });
@@ -92,6 +97,96 @@ test("opening a titled video captures the actual detail ID and URL", async (t) =
   assert.equal(opened.media.tileId, "real-edit-id");
   assert.equal(opened.media.href, detailUrl);
   assert.equal(opened.media.providerMediaId, undefined);
+});
+
+test("generation polling opens the new thumbnail when video titles are identical", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "flow-media-test-"));
+  const config = { ...loadConfig(), profileDir: path.join(directory, "profile"), stateFile: path.join(directory, "state.sqlite") };
+  const store = new StateStore(config.stateFile);
+  const browser = await chromium.launch({ executablePath: config.browserExecutable, headless: true });
+  t.after(async () => { await browser.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const adapter = new FlowBrowserAdapter(config, store);
+  adapter["context"] = context;
+  adapter["page"] = page;
+  const projectUrl = "https://flow.google.com/project/thumbnail-project";
+  const firstThumbnail = "https://flow.google.com/asb/first-thumbnail";
+  const secondThumbnail = "https://flow.google.com/asb/second-thumbnail";
+  const detailUrl = `${projectUrl}/edit/second-video`;
+  await page.route("**/*", async (route) => {
+    const url = route.request().url();
+    if (url === firstThumbnail || url === secondThumbnail) {
+      await route.fulfill({ contentType: "image/gif", body: Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64") });
+      return;
+    }
+    await route.fulfill({ contentType: "text/html", body: url === detailUrl
+      ? '<button aria-label="Download media">Download</button>'
+      : [firstThumbnail, secondThumbnail].map((thumbnail, index) => `
+        <flow-grid-tile-container aria-label="Officer questioning man on street" onclick="location.href='${projectUrl}/edit/${index === 0 ? "first-video" : "second-video"}'">
+          <flow-tile-container><div class="container" style="width:474px;height:267px">
+            <flow-video-tile><div class="container">
+              <img draggable="false" alt="生成的视频缩略图" class="thumbnail" src="${thumbnail}" width="474" height="267">
+              <div class="pre-hover-overlay"><div class="type-icon-container"><span>play_circle</span><span class="resolution-badge">360p</span></div></div>
+            </div></flow-video-tile>
+          </div></flow-tile-container>
+        </flow-grid-tile-container>`).join("") });
+  });
+  await page.goto(projectUrl);
+  const inspection = await adapter.inspectPage();
+  assert.deepEqual(inspection.media.map((media) => media.tileId), [`thumbnail:${firstThumbnail}`, `thumbnail:${secondThumbnail}`]);
+  const result = await adapter.waitForMedia({
+    projectUrl, baselineMediaIds: [`thumbnail:${firstThumbnail}`], baselineFailureCount: 0,
+    expectedKind: "video", timeoutSeconds: 10, pollIntervalSeconds: 3,
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.media?.tileId, "second-video");
+  assert.equal(result.media?.href, detailUrl);
+  assert.equal(page.url(), detailUrl);
+});
+
+test("recorded media opens across official Flow project routes", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "flow-recorded-media-test-"));
+  const config = { ...loadConfig(), profileDir: path.join(directory, "profile"), stateFile: path.join(directory, "state.sqlite") };
+  const store = new StateStore(config.stateFile);
+  const project = await store.createProject({ title: "Recorded media", brief: "", language: "en" });
+  const browser = await chromium.launch({ executablePath: config.browserExecutable, headless: true });
+  t.after(async () => { await browser.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const adapter = new FlowBrowserAdapter(config, store);
+  adapter["context"] = context;
+  adapter["page"] = page;
+  const currentProject = "https://flow.google.com/project/recorded-project";
+  const legacyProject = "https://labs.google/fx/tools/flow/project/recorded-project";
+  await page.route("**/*", async (route) => {
+    const url = route.request().url();
+    const isProject = url === currentProject || url === legacyProject;
+    await route.fulfill({ contentType: "text/html", body: isProject ? `
+      <div data-tile-id="fe_id_recorded-video">
+        <a href="${url}/edit/grid-video"><video data-media-id="recorded-video" width="64" height="64"></video></a>
+      </div>` : '<button aria-label="Download media">Download</button>' });
+  });
+  for (const scenario of [
+    { name: "legacy media from the current project route", projectUrl: currentProject, mediaUrl: `${legacyProject}/edit/saved-video`, recorded: true },
+    { name: "current media from the legacy project route", projectUrl: legacyProject, mediaUrl: `${currentProject}/edit/saved-video`, recorded: true },
+    { name: "an unrelated host falls back to the project grid", projectUrl: currentProject, mediaUrl: "https://example.test/project/recorded-project/edit/saved-video", recorded: false },
+    { name: "a legacy path on the current host falls back to the project grid", projectUrl: currentProject, mediaUrl: "https://flow.google.com/fx/tools/flow/project/recorded-project/edit/saved-video", recorded: false },
+    { name: "a current path on the legacy host falls back to the project grid", projectUrl: currentProject, mediaUrl: "https://labs.google/project/recorded-project/edit/saved-video", recorded: false },
+    { name: "another project falls back to the project grid", projectUrl: currentProject, mediaUrl: "https://flow.google.com/project/other-project/edit/saved-video", recorded: false },
+    { name: "an HTTP media URL falls back to the project grid", projectUrl: currentProject, mediaUrl: "http://flow.google.com/project/recorded-project/edit/saved-video", recorded: false },
+  ]) {
+    await t.test(scenario.name, async () => {
+      await store.registerAsset({
+        projectId: project.id, kind: "video", role: "generated", providerMediaId: "recorded-video",
+        providerMediaUrl: scenario.mediaUrl, title: "Recorded video", locked: true,
+      });
+      const opened = await adapter.openMedia({ projectUrl: scenario.projectUrl, mediaId: "recorded-video" });
+      const expectedUrl = scenario.recorded ? scenario.mediaUrl : `${scenario.projectUrl}/edit/grid-video`;
+      assert.equal(opened.media.href, expectedUrl);
+      assert.equal(page.url(), expectedUrl);
+    });
+  }
 });
 
 test("download resolution selects the requested visible option and rejects upgrades without fallback", async (t) => {

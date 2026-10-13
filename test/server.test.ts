@@ -140,6 +140,73 @@ for (const [target, generation] of [["720p", "360p"], ["1080p", "720p"]] as cons
   });
 }
 
+test("a confirmed browser session can open another local project", async (t) => {
+  const fixture = await routingFixture(t);
+  const second = await fixture.call<ProjectRecord>("project_create", { title: "Second", brief: "" });
+  await fixture.store.update((state) => {
+    state.auth.status = "ready";
+    state.auth.freshLoginForProjectId = fixture.project.id;
+  });
+  fixture.flow.openFlowProject = async (url) => ({
+    url, title: "Second", visibleText: "", buttons: [], textboxes: [], fileInputCount: 0, media: [], failureCount: 0,
+  });
+  const result = await fixture.raw("flow_open_project", {
+    projectId: second.id, projectUrl: "https://flow.google.com/project/second",
+  });
+  assert.notEqual(result.isError, true, JSON.stringify(result.content));
+});
+
+test("a pending shot cannot be resubmitted as a new version after a polling timeout", async (t) => {
+  const fixture = await routingFixture(t, "720p");
+  const prepared = await fixture.prepare();
+  await fixture.store.updateJob(prepared.job.id, { state: "submitted" });
+  await fixture.store.updateJob(prepared.job.id, { state: "generating" });
+  fixture.observed.browserActions.length = 0;
+  const result = await fixture.raw("flow_prepare_generation", {
+    projectId: fixture.project.id, operation: "video", shotIndex: 1, version: 2,
+    prompt: "The man rubs his hands.", textboxLabel: "Flow prompt",
+  });
+  assert.equal(result.isError, true);
+  assert.match(JSON.stringify(result.content), /unresolved/i);
+  assert.match(JSON.stringify(result.content), new RegExp(prepared.job.id));
+  assert.equal((await fixture.store.read()).jobs.length, 1);
+  assert.deepEqual(fixture.observed.browserActions, []);
+});
+
+test("polling timeout reports unknown provider status and only permits retrying observation", async (t) => {
+  const fixture = await routingFixture(t, "720p");
+  const prepared = await fixture.prepare();
+  await fixture.store.updateJob(prepared.job.id, { state: "submitted" });
+  fixture.flow.waitForMedia = async () => ({
+    status: "timeout", observations: 1,
+    page: { url: "https://flow.google.com/project/test", title: "Film", visibleText: "play_circle 360p", buttons: [], textboxes: [], fileInputCount: 0, media: [], failureCount: 0 },
+  });
+  const result = await fixture.call<{ status: string; providerStatus: string; retryAction: string; resubmitSafe: boolean; observation: { visibleMediaCount: number } }>("flow_wait_for_generation", {
+    jobId: prepared.job.id, timeoutSeconds: 10,
+  });
+  assert.equal(result.status, "timeout");
+  assert.equal(result.providerStatus, "unknown");
+  assert.equal(result.retryAction, "flow_wait_for_generation");
+  assert.equal(result.resubmitSafe, false);
+  assert.equal(result.observation.visibleMediaCount, 0);
+});
+
+test("a prepared alternative waits for the submitted version to reach a verified terminal state", async (t) => {
+  const fixture = await routingFixture(t, "720p");
+  const first = await fixture.prepare();
+  const second = await fixture.prepare({ version: 2 });
+  const submit = (jobId: string) => fixture.raw("flow_submit_generation", {
+    jobId, buttonLabel: "Generate", userApprovedCreditSpend: true,
+  });
+  assert.notEqual((await submit(first.job.id)).isError, true);
+  const unresolved = await submit(second.job.id);
+  assert.equal(unresolved.isError, true);
+  assert.equal(fixture.observed.clicked, 1);
+  await fixture.store.updateJob(first.job.id, { state: "complete", providerMediaId: "completed-video" });
+  assert.notEqual((await submit(second.job.id)).isError, true);
+  assert.equal(fixture.observed.clicked, 2);
+});
+
 test("MCP asks for a video target before browser actions or creating a job", async (t) => {
   const fixture = await routingFixture(t);
   const result = await fixture.raw("flow_prepare_generation", {

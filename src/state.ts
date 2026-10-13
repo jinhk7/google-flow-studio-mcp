@@ -81,9 +81,6 @@ export class StateStore {
     };
     await this.update((state) => {
       state.projects.push(project);
-      state.auth.status = "awaiting_user_fresh_sign_in";
-      state.auth.freshLoginForProjectId = undefined;
-      state.auth.lastMessage = "A fresh user-completed Google sign-in is required for this project.";
     });
     this.recordEvent("project.created", project.id, project);
     return project;
